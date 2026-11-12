@@ -484,6 +484,7 @@
         if(r2.ok && r2.data && r2.data.id){
           setGistId(r2.data.id);
           toast('已重新创建云端备份 ✅');
+          gistShareHint(r2.data);
         }else{
           toast(ghErrorText(r2 || r, '上传'));
         }
@@ -494,8 +495,70 @@
       }
     }
     if(!r.ok){ toast(ghErrorText(r, '上传')); return; }
-    if(r.data && r.data.id) setGistId(r.data.id);
-    toast('云端已同步 ✅');
+    if(r.data && r.data.id){
+      setGistId(r.data.id);
+      gistShareHint(r.data);
+    }else{
+      toast('云端已同步 ✅');
+    }
+  }
+
+  // 上传成功后提示备份链接，方便跨设备同步
+  function gistShareHint(gistObj){
+    var url = gistObj.html_url || ('https://gist.github.com/' + (gistObj.owner && gistObj.owner.login || '') + '/' + gistObj.id);
+    var ok = false;
+    try{
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(url).then(function(){
+          toast('云端已同步，链接已复制 ✅');
+        }, function(){
+          toast('云端已同步 ✅');
+        });
+        ok = true;
+      }
+    }catch(e){}
+    if(!ok){ toast('云端已同步 ✅'); }
+    setTimeout(function(){
+      alert('上传成功 ✅\n\n备份链接：\n' + url +
+        '\n\n在另一台设备上：\n① 打开网站，先在设置里填同一个 GitHub Token\n② 点「📥 从云端拉取」，它会自动列出你账号下的所有备份让你选\n③ 选这一条，就能同步过来了\n\n（链接已经帮你复制到剪贴板）');
+    }, 60);
+  }
+
+  // 列出当前账号下所有 zhaobudao 备份 gist，让用户选一个
+  async function gistPick(){
+    var token = gistToken();
+    if(!token){ openGistSetup(); return; }
+    toast('正在读取你的云端备份…');
+    var r;
+    try{
+      r = await ghParse(await fetch('https://api.github.com/gists?per_page=100', { headers: ghHeaders(token) }));
+    }catch(e){
+      toast('网络不通：' + e.message); return;
+    }
+    if(!r.ok){ toast(ghErrorText(r, '读取备份列表')); return; }
+    var items = (r.data || []).filter(function(g){
+      return g.files && g.files[gistFilename()];
+    });
+    if(items.length === 0){
+      alert('这个 GitHub 账号下还没有任何「怎么又找不到了」的云端备份。\n\n请先在有数据的那台设备上点「☁ 上传到云端」创建备份。');
+      return;
+    }
+    // 按更新时间倒序
+    items.sort(function(a,b){ return (b.updated_at || '').localeCompare(a.updated_at || ''); });
+    var lines = ['你的账号下有 ' + items.length + ' 个备份，请选一个：', ''];
+    items.forEach(function(g, i){
+      var desc = (g.description || '').trim() || '(无备注)';
+      var file = g.files[gistFilename()];
+      var sizeKB = Math.round(((file.size || 0) / 1024) * 10) / 10;
+      var time = (g.updated_at || '').replace('T', ' ').slice(0, 16);
+      lines.push('[' + (i + 1) + '] ' + desc);
+      lines.push('    ' + time + '  ·  ' + sizeKB + ' KB  ·  ID: ' + g.id.slice(0, 10) + '…');
+    });
+    var n = parseInt(prompt(lines.join('\n'), '1'), 10);
+    if(!(n >= 1 && n <= items.length)){ toast('已取消'); return; }
+    setGistId(items[n - 1].id);
+    toast('已选中备份，现在拉取…');
+    setTimeout(function(){ gistLoad(); }, 200);
   }
 
   // 诊断：确认 Token 是否有效、是否具备 gist 权限
@@ -528,7 +591,9 @@
 
   async function gistLoad(){
     var token = gistToken(), id = gistId();
-    if(!token || !id){ openGistSetup(); return; }
+    if(!token){ openGistSetup(); return; }
+    // 没有已保存的 gistId 时，让用户从当前账号下挑一个备份
+    if(!id){ gistPick(); return; }
     toast('正在从云端拉取…');
     try{
       var res = await fetch('https://api.github.com/gists/' + encodeURIComponent(id), {
