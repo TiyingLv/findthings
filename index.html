@@ -426,36 +426,104 @@
 
   function gistFilename(){ return 'zhaobudao-data.json'; }
 
+  function ghHeaders(token, withBody){
+    var h = { 'Authorization':'Bearer ' + token, 'Accept':'application/vnd.github+json' };
+    if(withBody) h['Content-Type'] = 'application/json';
+    return h;
+  }
+
+  // 统一解析响应，保留 GitHub 返回的原始错误信息，方便定位问题
+  async function ghParse(res){
+    var txt = '';
+    try{ txt = await res.text(); }catch(e){ txt = ''; }
+    var data = null;
+    try{ data = txt ? JSON.parse(txt) : null; }catch(e){ data = null; }
+    return { ok: res.ok, status: res.status, data: data, raw: txt,
+             scopes: res.headers.get('x-oauth-scopes') };
+  }
+
+  function ghErrorText(r, what){
+    var msg = (r.data && r.data.message) ? r.data.message : String(r.raw || '').slice(0, 100);
+    if(r.status === 401) return what + '失败：Token 无效或已过期（401）';
+    if(r.status === 403) return what + '失败：权限不足或触发了频率限制（403）' + (msg ? '　' + msg : '');
+    if(r.status === 404) return what + '失败：Token 缺少 gist 权限，或云端备份已不存在（404）';
+    if(r.status === 409) return what + '失败：云端数据冲突（409）' + (msg ? '　' + msg : '');
+    if(r.status === 422) return what + '失败：请求内容被拒绝（422）' + (msg ? '　' + msg : '');
+    return what + '失败：HTTP ' + r.status + (msg ? '　' + msg : '');
+  }
+
+  // 推送到云端；id 为空表示新建
+  async function gistPush(token, id){
+    var payload = { description: 'zhaobudao backup', public: false, files: {} };
+    payload.files[gistFilename()] = { content: JSON.stringify(state, null, 2) };
+    var url = id ? ('https://api.github.com/gists/' + encodeURIComponent(id)) : 'https://api.github.com/gists';
+    var res = await fetch(url, {
+      method: id ? 'PATCH' : 'POST',
+      headers: ghHeaders(token, true),
+      body: JSON.stringify(payload)
+    });
+    return await ghParse(res);
+  }
+
   async function gistSave(){
     var token = gistToken(), id = gistId();
     if(!token){ openGistSetup(); return; }
-    var payload = {
-      description: 'zhaobudao backup',
-      public: false,
-      files: {}
-    };
-    payload.files[gistFilename()] = { content: JSON.stringify(state, null, 2) };
     toast('正在上传到云端…');
+    var r;
     try{
-      var res;
-      if(id){
-        res = await fetch('https://api.github.com/gists/' + id, {
-          method:'PATCH', headers:{'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','Content-Type':'application/json'},
-          body: JSON.stringify(payload)
-        });
-      }else{
-        res = await fetch('https://api.github.com/gists', {
-          method:'POST', headers:{'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','Content-Type':'application/json'},
-          body: JSON.stringify(payload)
-        });
-      }
-      if(!res.ok) throw new Error('HTTP '+res.status);
-      var j = await res.json();
-      if(!id && j.id){ setGistId(j.id); }
-      toast('云端已同步 ✅');
+      r = await gistPush(token, id);
     }catch(e){
-      toast('上传失败：' + e.message);
+      toast('网络不通：' + e.message);
+      return;
     }
+    // 已有的备份 ID 失效（被删除、换过 Token、冲突）时，自动重新建一个
+    if(!r.ok && id && (r.status === 404 || r.status === 409)){
+      try{
+        setGistId('');
+        var r2 = await gistPush(token, '');
+        if(r2.ok && r2.data && r2.data.id){
+          setGistId(r2.data.id);
+          toast('已重新创建云端备份 ✅');
+        }else{
+          toast(ghErrorText(r2 || r, '上传'));
+        }
+        return;
+      }catch(e){
+        toast('网络不通：' + e.message);
+        return;
+      }
+    }
+    if(!r.ok){ toast(ghErrorText(r, '上传')); return; }
+    if(r.data && r.data.id) setGistId(r.data.id);
+    toast('云端已同步 ✅');
+  }
+
+  // 诊断：确认 Token 是否有效、是否具备 gist 权限
+  async function gistTest(){
+    var token = gistToken();
+    if(!token){ openGistSetup(); return; }
+    toast('正在测试连接…');
+    var r;
+    try{
+      r = await ghParse(await fetch('https://api.github.com/user', { headers: ghHeaders(token) }));
+    }catch(e){
+      toast('网络不通：' + e.message);
+      return;
+    }
+    if(!r.ok){ alert(ghErrorText(r, '连接测试')); return; }
+    var login = (r.data && r.data.login) || '（未知）';
+    var scopes = r.scopes;
+    if(!scopes){
+      alert('Token 可以登录，账号：' + login + '\n\n' +
+        '但它没有返回任何权限范围，很可能是 Fine-grained token。\n' +
+        'GitHub Gist 接口不支持 Fine-grained token，请到「Personal access tokens → Tokens (classic)」新建一个勾选 gist 的 Token。');
+      return;
+    }
+    if(!/(^|[\s,])gist([\s,]|$)/.test(scopes)){
+      alert('Token 可以登录，账号：' + login + '\n但缺少 gist 权限。\n当前权限：' + scopes + '\n\n请新建一个勾选 gist 的 Token 再试。');
+      return;
+    }
+    alert('连接正常 ✅\n账号：' + login + '\n权限：' + scopes);
   }
 
   async function gistLoad(){
@@ -463,11 +531,12 @@
     if(!token || !id){ openGistSetup(); return; }
     toast('正在从云端拉取…');
     try{
-      var res = await fetch('https://api.github.com/gists/'+id, {
-        headers:{'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'}
+      var res = await fetch('https://api.github.com/gists/' + encodeURIComponent(id), {
+        headers: ghHeaders(token)
       });
-      if(!res.ok) throw new Error('HTTP '+res.status);
-      var j = await res.json();
+      var rr = await ghParse(res);
+      if(!rr.ok){ toast(ghErrorText(rr, '拉取')); return; }
+      var j = rr.data;
       var content = j.files && j.files[gistFilename()] && j.files[gistFilename()].content;
       if(!content){ toast('云端没有数据'); return; }
       var d = JSON.parse(content);
@@ -1508,6 +1577,7 @@
         '<button class="menu-btn" data-sync="save">☁　上传到云端</button>' +
         '<button class="menu-btn" data-sync="load">📥　从云端拉取</button>' +
         '<button class="menu-btn" data-sync="setup">🔐　GitHub Token 设置</button>' +
+        '<button class="menu-btn" data-sync="test">🔍　测试云端连接</button>' +
         '<div style="height:10px"></div>' +
         '<button class="menu-btn" data-exp="export">⬇　导出 JSON 备份</button>' +
         '<button class="menu-btn" data-exp="import">⬆　从 JSON 导入</button>' +
@@ -1525,6 +1595,7 @@
         setTimeout(function(){
           if(a === 'save') gistSave();
           else if(a === 'load') gistLoad();
+          else if(a === 'test') gistTest();
           else if(a === 'setup') openGistSetup();
         }, 180); return;
       }
@@ -1562,9 +1633,10 @@
       '<div class="banner" style="margin-bottom:8px">' +
         '<b>只需做一次：</b><br>' +
         '① 打开 <a href="https://github.com/settings/tokens/new?scopes=gist&description=zhaobudao" target="_blank" rel="noopener" style="color:var(--accent)">github.com/settings/tokens</a><br>' +
-        '② Note 随便填、勾选 <b>gist</b> scope，创建<br>' +
-        '③ 复制生成的 Token，粘贴到下面<br>' +
-        '④ 保存后点「上传到云端」就会自动创建 gist，以后每次都会更新同一个 gist</div>' +
+        '② 注意必须选 <b>Tokens (classic)</b>，Fine-grained token 不支持 Gist<br>' +
+        '③ Note 随便填、勾选 <b>gist</b> scope，创建<br>' +
+        '④ 复制生成的 Token，粘贴到下面，然后点「测试云端连接」确认<br>' +
+        '⑤ 通过后点「上传到云端」会自动创建 gist，以后每次都更新同一个</div>' +
       '<label class="field"><span>GitHub Personal Access Token</span>' +
         '<input name="token" type="password" value="' + esc(gistToken()) + '" placeholder="ghp_xxx..." autocomplete="off" spellcheck="false"></label>' +
       '<div class="detail-meta" style="font-size:12.5px">' +
